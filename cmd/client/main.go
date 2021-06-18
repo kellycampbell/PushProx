@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,15 +44,19 @@ import (
 )
 
 var (
-	myFqdn      = kingpin.Flag("fqdn", "FQDN to register with").Default(fqdn.Get()).String()
-	proxyURL    = kingpin.Flag("proxy-url", "Push proxy to talk to.").Required().String()
-	caCertFile  = kingpin.Flag("tls.cacert", "<file> CA certificate to verify peer against").String()
-	tlsCert     = kingpin.Flag("tls.cert", "<cert> Client certificate file").String()
-	tlsKey      = kingpin.Flag("tls.key", "<key> Private key file").String()
-	metricsAddr = kingpin.Flag("metrics-addr", "Serve Prometheus metrics at this address").Default(":9369").String()
+	myFqdn       = kingpin.Flag("fqdn", "FQDN to register with").Default(fqdn.Get()).String()
+	proxyURL     = kingpin.Flag("proxy-url", "Push proxy to talk to.").Required().String()
+	caCertFile   = kingpin.Flag("tls.cacert", "<file> CA certificate to verify peer against").String()
+	tlsCert      = kingpin.Flag("tls.cert", "<cert> Client certificate file").String()
+	tlsKey       = kingpin.Flag("tls.key", "<key> Private key file").String()
+	metricsAddr  = kingpin.Flag("metrics-addr", "Serve Prometheus metrics at this address").Default(":9369").String()
+	allowedPorts = util.IntList(kingpin.Flag("allowed-ports", "List of ports which proxy is allowed to access").Default(""))
 
 	retryInitialWait = kingpin.Flag("proxy.retry.initial-wait", "Amount of time to wait after proxy failure").Default("1s").Duration()
 	retryMaxWait     = kingpin.Flag("proxy.retry.max-wait", "Maximum amount of time to wait between proxy poll retries").Default("5s").Duration()
+
+	maxScrapeTimeout     = kingpin.Flag("scrape.max-timeout", "Any scrape with a timeout higher than this will have to be clamped to this.").Default("5m").Duration()
+	defaultScrapeTimeout = kingpin.Flag("scrape.default-timeout", "If a scrape lacks a timeout, use this value.").Default("15s").Duration()
 )
 
 var (
@@ -111,11 +116,9 @@ func (c *Coordinator) handleErr(request *http.Request, client *http.Client, err 
 
 func (c *Coordinator) doScrape(request *http.Request, client *http.Client) {
 	logger := log.With(c.logger, "scrape_id", request.Header.Get("id"))
-	timeout, err := util.GetHeaderTimeout(request.Header)
-	if err != nil {
-		c.handleErr(request, client, err)
-		return
-	}
+	level.Info(logger).Log("msg", "doScrape")
+
+	timeout := util.GetScrapeTimeout(maxScrapeTimeout, defaultScrapeTimeout, request.Header)
 	ctx, cancel := context.WithTimeout(request.Context(), timeout)
 	defer cancel()
 	request = request.WithContext(ctx)
@@ -130,6 +133,15 @@ func (c *Coordinator) doScrape(request *http.Request, client *http.Client) {
 
 	if request.URL.Hostname() != *myFqdn {
 		c.handleErr(request, client, errors.New("scrape target doesn't match client fqdn"))
+		return
+	}
+
+	port, err := strconv.Atoi(request.URL.Port())
+	if err != nil {
+		port = 80
+	}
+	if len(*allowedPorts) != 0 && !util.IntListContains(*allowedPorts, port) {
+		c.handleErr(request, client, errors.New("scrape target port not allwed"))
 		return
 	}
 
@@ -235,6 +247,8 @@ func main() {
 	kingpin.Parse()
 	logger := promlog.New(&promlogConfig)
 	coordinator := Coordinator{logger: logger}
+
+	fmt.Printf("allowedPorts = %v\n", allowedPorts)
 
 	if *proxyURL == "" {
 		level.Error(coordinator.logger).Log("msg", "--proxy-url flag must be specified.")
