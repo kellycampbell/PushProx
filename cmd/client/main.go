@@ -226,12 +226,17 @@ func (c *Coordinator) doPoll(client *http.Client) error {
 	return nil
 }
 
-func (c *Coordinator) loop(bo backoff.BackOff, client *http.Client) {
+func (c *Coordinator) loop(bo backoff.BackOff, client *http.Client, stopCh <-chan bool) {
 	op := func() error {
 		return c.doPoll(client)
 	}
 
 	for {
+		if <-stopCh {
+			// log.Info("Shutting down windows_exporter")
+			break
+		}
+
 		if err := backoff.RetryNotify(op, bo, func(err error, _ time.Duration) {
 			pollErrorCounter.Inc()
 		}); err != nil {
@@ -287,9 +292,18 @@ func main() {
 		tlsConfig.RootCAs = caCertPool
 	}
 
+	server := http.Server{
+		Addr:    *metricsAddr,
+		Handler: promhttp.Handler(),
+	}
+
+	stopCh := make(chan bool)
+
+	util.InitService("prometheus_proxy_client", &server, stopCh)
 	if *metricsAddr != "" {
 		go func() {
-			if err := http.ListenAndServe(*metricsAddr, promhttp.Handler()); err != nil {
+			// log.Infof("starting Prometheus PushProxy client on %q", *metricsAddr)
+			if err := server.ListenAndServe(); err != nil {
 				level.Warn(coordinator.logger).Log("msg", "ListenAndServe", "err", err)
 			}
 		}()
@@ -311,5 +325,6 @@ func main() {
 
 	client := &http.Client{Transport: transport}
 
-	coordinator.loop(newBackOffFromFlags(), client)
+	coordinator.loop(newBackOffFromFlags(), client, stopCh)
+
 }
