@@ -144,6 +144,7 @@ func (h *httpHandler) handlePush(w http.ResponseWriter, r *http.Request) {
 // handlePoll handles clients registering and asking for scrapes.
 func (h *httpHandler) handlePoll(w http.ResponseWriter, r *http.Request) {
 	fqdn, _ := ioutil.ReadAll(r.Body)
+	level.Info(h.logger).Log("msg", "Received poll request from", "fqdn", fqdn)
 	request, err := h.coordinator.WaitForScrapeInstruction(strings.TrimSpace(string(fqdn)))
 	if err != nil {
 		level.Info(h.logger).Log("msg", "Error WaitForScrapeInstruction:", "err", err)
@@ -208,9 +209,29 @@ func main() {
 	mux := http.NewServeMux()
 	handler := newHTTPHandler(logger, coordinator, mux)
 
-	level.Info(logger).Log("msg", "Listening", "address", *listenAddress)
-	if err := http.ListenAndServe(*listenAddress, handler); err != nil {
-		level.Error(logger).Log("msg", "Listening failed", "err", err)
-		os.Exit(1)
+	server := http.Server{
+		Addr:    *listenAddress,
+		Handler: handler,
 	}
+
+	stopCh := make(chan bool)
+
+	util.InitService("prometheus_proxy_server", &server, stopCh)
+	go func() {
+		// log.Infof("starting Prometheus PushProxy client on %q", *metricsAddr)
+		level.Info(logger).Log("msg", "Listening", "address", *listenAddress)
+		if err := server.ListenAndServe(); err != nil {
+			level.Error(logger).Log("msg", "Listening failed", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	for {
+		if <-stopCh {
+			// log.Info("Shutting down prometheus_proxy_server")
+			break
+		}
+	}
+	return
+
 }

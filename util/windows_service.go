@@ -61,13 +61,14 @@ loop:
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
+				fmt.Println("Stop or Shutdown signal received")
 				log.Info("Stop or Shutdown signal received")
+				changes <- svc.Status{State: svc.StopPending}
 				s.stopCh <- true
 				ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
 				defer func() {
 					cancel()
 				}()
-				changes <- svc.Status{State: svc.StopPending}
 				if err := s.server.Shutdown(ctx); err != nil {
 					log.Fatalf("server shutdown error: %+s", err)
 				}

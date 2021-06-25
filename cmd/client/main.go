@@ -95,7 +95,9 @@ func newBackOffFromFlags() backoff.BackOff {
 
 // Coordinator for scrape requests and responses
 type Coordinator struct {
-	logger log.Logger
+	logger   log.Logger
+	cancelFn context.CancelFunc
+	done     bool
 }
 
 func (c *Coordinator) handleErr(request *http.Request, client *http.Client, err error) {
@@ -204,12 +206,31 @@ func (c *Coordinator) doPoll(client *http.Client) error {
 		level.Error(c.logger).Log("msg", "Error parsing url:", "err", err)
 		return errors.Wrap(err, "error parsing url poll")
 	}
+
 	url := base.ResolveReference(u)
-	resp, err := client.Post(url.String(), "", strings.NewReader(*myFqdn))
+	level.Info(c.logger).Log("msg", "doPoll making read request ", "URL", url)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancelFn = func() {
+		level.Info(c.logger).Log("msg", "cancelFn called")
+		cancel()
+	}
+	defer c.cancelFn()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url.String(), strings.NewReader(*myFqdn))
+	if err != nil {
+		level.Error(c.logger).Log("msg", "Error creating poll request:", "err", err)
+		return errors.Wrap(err, "error creating poll request")
+	}
+
+	resp, err := client.Do(req)
+
 	if err != nil {
 		level.Error(c.logger).Log("msg", "Error polling:", "err", err)
 		return errors.Wrap(err, "error polling")
 	}
+	level.Info(c.logger).Log("msg", "poll response received ")
+
 	defer resp.Body.Close()
 
 	request, err := http.ReadRequest(bufio.NewReader(resp.Body))
@@ -226,22 +247,29 @@ func (c *Coordinator) doPoll(client *http.Client) error {
 	return nil
 }
 
-func (c *Coordinator) loop(bo backoff.BackOff, client *http.Client, stopCh <-chan bool) {
+func (c *Coordinator) loop(bo backoff.BackOff, client *http.Client) {
+	level.Info(c.logger).Log("msg", "loop")
+
 	op := func() error {
 		return c.doPoll(client)
 	}
 
 	for {
-		if <-stopCh {
-			// log.Info("Shutting down windows_exporter")
-			break
+		if !c.done {
+			if err := backoff.RetryNotify(op, bo, func(err error, _ time.Duration) {
+				pollErrorCounter.Inc()
+			}); err != nil {
+				level.Error(c.logger).Log("err", err)
+			}
 		}
+	}
+	level.Info(c.logger).Log("msg", "loop finished")
+}
 
-		if err := backoff.RetryNotify(op, bo, func(err error, _ time.Duration) {
-			pollErrorCounter.Inc()
-		}); err != nil {
-			level.Error(c.logger).Log("err", err)
-		}
+func (c *Coordinator) stopLoop() {
+	c.done = true
+	if c.cancelFn != nil {
+		c.cancelFn()
 	}
 }
 
@@ -300,14 +328,12 @@ func main() {
 	stopCh := make(chan bool)
 
 	util.InitService("prometheus_proxy_client", &server, stopCh)
-	if *metricsAddr != "" {
-		go func() {
-			// log.Infof("starting Prometheus PushProxy client on %q", *metricsAddr)
-			if err := server.ListenAndServe(); err != nil {
-				level.Warn(coordinator.logger).Log("msg", "ListenAndServe", "err", err)
-			}
-		}()
-	}
+	go func() {
+		level.Info(coordinator.logger).Log("msg", "starting Prometheus PushProxy client on ", "addr", *metricsAddr)
+		if err := server.ListenAndServe(); err != nil {
+			level.Warn(coordinator.logger).Log("msg", "ListenAndServe", "err", err)
+		}
+	}()
 
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -325,6 +351,12 @@ func main() {
 
 	client := &http.Client{Transport: transport}
 
-	coordinator.loop(newBackOffFromFlags(), client, stopCh)
+	level.Info(coordinator.logger).Log("msg", "Starting loop")
 
+	go coordinator.loop(newBackOffFromFlags(), client)
+
+	if <-stopCh {
+		level.Info(coordinator.logger).Log("msg", "Shutting down")
+		coordinator.stopLoop()
+	}
 }
