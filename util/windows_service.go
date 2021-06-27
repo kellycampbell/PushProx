@@ -24,29 +24,36 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/prometheus-community/pushprox/log"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
+
 	"golang.org/x/sys/windows/svc"
 )
 
 type windowsService struct {
-	stopCh chan<- bool
-	server *http.Server
+	stopCh             chan<- bool
+	finishedCh         <-chan bool
+	shutdownCompleteCh chan<- bool
+	server             *http.Server
+	logger             log.Logger
 }
 
-func InitService(serviceName string, server *http.Server, stopCh chan<- bool) {
+func InitService(serviceName string, server *http.Server, logger log.Logger, stopCh chan<- bool, finishedCh <-chan bool) chan bool {
 	isService, err := svc.IsWindowsService()
 	if err != nil {
-		log.Fatalf("failed to determine if we are running as service: %v", err)
+		level.Error(logger).Log("msg", "failed to determine if we are running as service", "err", err)
 	}
+	shutdownCompleteCh := make(chan bool)
 	if isService {
 		go func() {
-			log.Info("Running as a service")
-			err = svc.Run(serviceName, &windowsService{stopCh: stopCh, server: server})
+			level.Info(logger).Log("msg", "Running as a service")
+			err = svc.Run(serviceName, &windowsService{stopCh: stopCh, server: server, logger: logger, shutdownCompleteCh: shutdownCompleteCh})
 			if err != nil {
-				log.Infof("Failed to start service: %v\n", err)
+				level.Info(logger).Log("msg", "Failed to start service", "err", err)
 			}
 		}()
 	}
+	return shutdownCompleteCh
 }
 
 func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
@@ -61,22 +68,23 @@ loop:
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
-				fmt.Println("Stop or Shutdown signal received")
-				log.Info("Stop or Shutdown signal received")
-				changes <- svc.Status{State: svc.StopPending}
+				level.Info(s.logger).Log("msg", "Stop or Shutdown signal received")
 				s.stopCh <- true
-				ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 				defer func() {
 					cancel()
 				}()
+				changes <- svc.Status{State: svc.StopPending}
 				if err := s.server.Shutdown(ctx); err != nil {
-					log.Fatalf("server shutdown error: %+s", err)
+					level.Error(s.logger).Log("msg", "server shutdown error", "err", err)
 				}
+				level.Info(s.logger).Log("msg", "break loop in windows_service")
 				break loop
 			default:
-				log.Info(fmt.Sprintf("unexpected control request #%d", c))
+				level.Info(s.logger).Log("msg", fmt.Sprintf("unexpected control request #%d", c))
 			}
 		}
 	}
+	close(s.shutdownCompleteCh)
 	return
 }

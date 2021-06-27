@@ -27,7 +27,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/windows"
 
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 
@@ -212,10 +215,9 @@ func (c *Coordinator) doPoll(client *http.Client) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancelFn = func() {
-		level.Info(c.logger).Log("msg", "cancelFn called")
+		// level.Info(c.logger).Log("msg", "cancelFn called")
 		cancel()
 	}
-	defer c.cancelFn()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url.String(), strings.NewReader(*myFqdn))
 	if err != nil {
@@ -224,12 +226,15 @@ func (c *Coordinator) doPoll(client *http.Client) error {
 	}
 
 	resp, err := client.Do(req)
-
 	if err != nil {
-		level.Error(c.logger).Log("msg", "Error polling:", "err", err)
-		return errors.Wrap(err, "error polling")
+		if errors.Is(err, context.Canceled) {
+			// level.Error(c.logger).Log("msg", "Returning backoff.Permanent", "err", err)
+			return backoff.Permanent(err)
+		} else {
+			level.Error(c.logger).Log("msg", "Error polling:", "err", err)
+			return errors.Wrap(err, "error polling")
+		}
 	}
-	level.Info(c.logger).Log("msg", "poll response received ")
 
 	defer resp.Body.Close()
 
@@ -247,23 +252,25 @@ func (c *Coordinator) doPoll(client *http.Client) error {
 	return nil
 }
 
-func (c *Coordinator) loop(bo backoff.BackOff, client *http.Client) {
-	level.Info(c.logger).Log("msg", "loop")
-
+func (c *Coordinator) loop(bo backoff.BackOff, client *http.Client, finishedCh chan<- bool) {
 	op := func() error {
 		return c.doPoll(client)
 	}
 
 	for {
-		if !c.done {
-			if err := backoff.RetryNotify(op, bo, func(err error, _ time.Duration) {
-				pollErrorCounter.Inc()
-			}); err != nil {
-				level.Error(c.logger).Log("err", err)
-			}
+		if c.done {
+			break
+		}
+		if err := backoff.RetryNotify(op, bo, func(err error, _ time.Duration) {
+			pollErrorCounter.Inc()
+		}); err != nil {
+			level.Error(c.logger).Log("err", err)
 		}
 	}
-	level.Info(c.logger).Log("msg", "loop finished")
+	level.Info(c.logger).Log("msg", "Coordinator loop finished")
+	if finishedCh != nil {
+		close(finishedCh)
+	}
 }
 
 func (c *Coordinator) stopLoop() {
@@ -273,15 +280,59 @@ func (c *Coordinator) stopLoop() {
 	}
 }
 
+// windows specific
+
+var (
+	kernel32         = syscall.MustLoadDLL("kernel32.dll")
+	procSetStdHandle = kernel32.MustFindProc("SetStdHandle")
+)
+
+// dupFD is used to initialize OrigStderr (see stderr_redirect.go).
+func dupFD(fd uintptr) (uintptr, error) {
+	// Adapted from https://github.com/golang/go/blob/go1.8/src/syscall/exec_windows.go#L303.
+	p, err := windows.GetCurrentProcess()
+	if err != nil {
+		return 0, err
+	}
+	var h windows.Handle
+	return uintptr(h), windows.DuplicateHandle(p, windows.Handle(fd), p, &h, 0, true, windows.DUPLICATE_SAME_ACCESS)
+}
+
+// redirectStderr is used to redirect internal writes to the error
+// handle to the specified file. This is needed to ensure that
+// harcoded writes to the error handle by e.g. the Go runtime are
+// redirected to a log file of our choosing.
+//
+// We also override os.Stderr for those other parts of Go which use
+// that and not fd 2 directly.
+func redirectStderr(f *os.File) error {
+	if err := windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(f.Fd())); err != nil {
+		return err
+	}
+	os.Stderr = f
+	return nil
+}
+
+// end windows specific
+
 func main() {
+
+	logfile, err := os.CreateTemp("", "pushprox-log-*.txt")
+	if err != nil {
+		fmt.Println("Error creating temp file", err)
+	}
+	fmt.Printf("Logging to temp file %v\n", logfile.Name)
+	err = redirectStderr(logfile)
+	if err != nil {
+		fmt.Println("Error redirecting stderr for logging", err)
+	}
+
 	promlogConfig := promlog.Config{}
 	flag.AddFlags(kingpin.CommandLine, &promlogConfig)
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
 	logger := promlog.New(&promlogConfig)
 	coordinator := Coordinator{logger: logger}
-
-	fmt.Printf("allowedPorts = %v\n", allowedPorts)
 
 	if *proxyURL == "" {
 		level.Error(coordinator.logger).Log("msg", "--proxy-url flag must be specified.")
@@ -326,8 +377,9 @@ func main() {
 	}
 
 	stopCh := make(chan bool)
+	finishedCh := make(chan bool)
 
-	util.InitService("prometheus_proxy_client", &server, stopCh)
+	shutdownCompleteCh := util.InitService("prometheus_proxy_client", &server, logger, stopCh, finishedCh)
 	go func() {
 		level.Info(coordinator.logger).Log("msg", "starting Prometheus PushProxy client on ", "addr", *metricsAddr)
 		if err := server.ListenAndServe(); err != nil {
@@ -353,10 +405,15 @@ func main() {
 
 	level.Info(coordinator.logger).Log("msg", "Starting loop")
 
-	go coordinator.loop(newBackOffFromFlags(), client)
+	go coordinator.loop(newBackOffFromFlags(), client, finishedCh)
 
 	if <-stopCh {
 		level.Info(coordinator.logger).Log("msg", "Shutting down")
 		coordinator.stopLoop()
 	}
+	<-finishedCh
+	level.Info(coordinator.logger).Log("msg", "Finished")
+	<-shutdownCompleteCh
+	level.Info(coordinator.logger).Log("msg", "Shutdown complete")
+	return
 }

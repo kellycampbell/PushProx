@@ -216,7 +216,7 @@ func main() {
 
 	stopCh := make(chan bool)
 
-	util.InitService("prometheus_proxy_server", &server, stopCh)
+	util.InitService("prometheus_proxy_server", &server, logger, stopCh, nil)
 	go func() {
 		// log.Infof("starting Prometheus PushProxy client on %q", *metricsAddr)
 		level.Info(logger).Log("msg", "Listening", "address", *listenAddress)
