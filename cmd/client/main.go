@@ -27,12 +27,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
-	"golang.org/x/sys/windows"
-
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
+
+	winlog "github.com/prometheus-community/pushprox/log"
 
 	"github.com/Showmax/go-fqdn"
 	"github.com/cenkalti/backoff/v4"
@@ -280,52 +279,8 @@ func (c *Coordinator) stopLoop() {
 	}
 }
 
-// windows specific
-
-var (
-	kernel32         = syscall.MustLoadDLL("kernel32.dll")
-	procSetStdHandle = kernel32.MustFindProc("SetStdHandle")
-)
-
-// dupFD is used to initialize OrigStderr (see stderr_redirect.go).
-func dupFD(fd uintptr) (uintptr, error) {
-	// Adapted from https://github.com/golang/go/blob/go1.8/src/syscall/exec_windows.go#L303.
-	p, err := windows.GetCurrentProcess()
-	if err != nil {
-		return 0, err
-	}
-	var h windows.Handle
-	return uintptr(h), windows.DuplicateHandle(p, windows.Handle(fd), p, &h, 0, true, windows.DUPLICATE_SAME_ACCESS)
-}
-
-// redirectStderr is used to redirect internal writes to the error
-// handle to the specified file. This is needed to ensure that
-// harcoded writes to the error handle by e.g. the Go runtime are
-// redirected to a log file of our choosing.
-//
-// We also override os.Stderr for those other parts of Go which use
-// that and not fd 2 directly.
-func redirectStderr(f *os.File) error {
-	if err := windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(f.Fd())); err != nil {
-		return err
-	}
-	os.Stderr = f
-	return nil
-}
-
-// end windows specific
-
 func main() {
-
-	logfile, err := os.CreateTemp("", "pushprox-log-*.txt")
-	if err != nil {
-		fmt.Println("Error creating temp file", err)
-	}
-	fmt.Printf("Logging to temp file %v\n", logfile.Name)
-	err = redirectStderr(logfile)
-	if err != nil {
-		fmt.Println("Error redirecting stderr for logging", err)
-	}
+	winlog.InitEventLog("prometheus_proxy_client")
 
 	promlogConfig := promlog.Config{}
 	flag.AddFlags(kingpin.CommandLine, &promlogConfig)

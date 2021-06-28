@@ -41,15 +41,15 @@ type windowsService struct {
 func InitService(serviceName string, server *http.Server, logger log.Logger, stopCh chan<- bool, finishedCh <-chan bool) chan bool {
 	isService, err := svc.IsWindowsService()
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to determine if we are running as service", "err", err)
+		level.Error(logger).Log("msg", "Failed to determine if we are running as Windows Service", "err", err)
 	}
 	shutdownCompleteCh := make(chan bool)
 	if isService {
 		go func() {
-			level.Info(logger).Log("msg", "Running as a service")
+			level.Info(logger).Log("msg", "Running as a Windows Service")
 			err = svc.Run(serviceName, &windowsService{stopCh: stopCh, server: server, logger: logger, shutdownCompleteCh: shutdownCompleteCh})
 			if err != nil {
-				level.Info(logger).Log("msg", "Failed to start service", "err", err)
+				level.Info(logger).Log("msg", "Failed to start Service", "err", err)
 			}
 		}()
 	}
@@ -78,7 +78,7 @@ loop:
 				if err := s.server.Shutdown(ctx); err != nil {
 					level.Error(s.logger).Log("msg", "server shutdown error", "err", err)
 				}
-				level.Info(s.logger).Log("msg", "break loop in windows_service")
+				level.Info(s.logger).Log("msg", "Exiting Windows Service loop")
 				break loop
 			default:
 				level.Info(s.logger).Log("msg", fmt.Sprintf("unexpected control request #%d", c))

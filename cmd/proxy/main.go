@@ -27,6 +27,8 @@ import (
 
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 
+	winlog "github.com/prometheus-community/pushprox/log"
+
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
@@ -195,6 +197,8 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	winlog.InitEventLog("prometheus_proxy_server")
+
 	promlogConfig := promlog.Config{}
 	flag.AddFlags(kingpin.CommandLine, &promlogConfig)
 	kingpin.HelpFlag.Short('h')

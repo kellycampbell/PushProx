@@ -6,5 +6,7 @@
 /data/
 /pushprox-client
 /pushprox-proxy
+/pushprox-client.exe
+/pushprox-proxy.exe
 
 /vendor
